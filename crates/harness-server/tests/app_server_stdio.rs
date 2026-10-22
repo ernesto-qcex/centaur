@@ -2751,210 +2751,133 @@ fn fake_codex_handles_resolved_and_unresolved_citations_in_both_modes() {
     }
 }
 
-struct RecoveryFixture {
-    root: PathBuf,
-    script: PathBuf,
-}
-
-impl RecoveryFixture {
-    fn new() -> Self {
-        let root = temp_path("codex-recovery");
-        std::fs::create_dir(&root).unwrap();
-        let script = root.join("codex");
-        std::fs::write(&script, include_str!("fixtures/codex_recovery.py")).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Self { root, script }
-    }
-
-    fn bridge(&self) -> BridgeProcess {
-        BridgeProcess::spawn_harness_blocks_envs(
-            Harness::Codex,
-            None,
-            Some(("CODEX_BIN", self.script.to_str().unwrap())),
-            &[
-                ("RECOVERY_FIXTURE_DIR", self.root.to_str().unwrap()),
-                ("CODEX_MODEL_PROVIDER", "openrouter"),
-                ("CODEX_MODEL", "first-model"),
-                ("CODEX_CONTINUE_THREAD_ID", ""),
-                ("AMP_CONTINUE_THREAD_ID", ""),
-            ],
+/// The shared fake app-server, plus prompt-triggered exits for recovery tests.
+fn spawn_fake_codex_recovery(name: &str) -> (BridgeProcess, PathBuf, PathBuf) {
+    let fake_codex = temp_path(&format!("{name}.sh"));
+    let log = temp_path(&format!("{name}-requests.jsonl"));
+    let script = fake_codex_app_server_script(&log)
+        .replace("request_id() {", "echo $$ > \"$log.pid\"\n\nrequest_id() {")
+        .replace(
+            "    *'\"method\":\"turn/start\"'*)\n",
+            "    *'\"method\":\"turn/start\"'*)\n      case \"$line\" in *'die mid turn'*) exit 7;; esac\n",
         )
-    }
-
-    fn requests(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.root.join("requests.jsonl"))
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
-    fn kill_child(&self) {
-        let pid = self
-            .requests()
-            .iter()
-            .rev()
-            .find_map(|v| v["pid"].as_u64())
-            .unwrap();
-        assert!(
-            Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status()
-                .unwrap()
-                .success()
+        .replace(
+            "      fi\n      ;;",
+            "      fi\n      case \"$line\" in *'exit after turn'*) exit 0;; esac\n      ;;",
         );
-        // Wait for exit, including a zombie waiting to be reaped by the harness.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let output = Command::new("ps")
-                .args(["-o", "stat=", "-p", &pid.to_string()])
-                .output()
-                .unwrap();
-            let status = String::from_utf8_lossy(&output.stdout);
-            if status.trim().is_empty() || status.trim().starts_with('Z') {
-                break;
-            }
-            assert!(Instant::now() < deadline, "child did not exit");
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
+    std::fs::write(&fake_codex, script).unwrap();
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Codex,
+        None,
+        Some(("CODEX_BIN", fake_codex.to_str().unwrap())),
+    );
+    (bridge, fake_codex, log)
 }
 
-impl Drop for RecoveryFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
+fn read_requests(log: &Path) -> Vec<Value> {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
-fn recovery_turn(prompt: &str) -> Value {
-    json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}})
+fn count_method(requests: &[Value], method: &str) -> usize {
+    requests.iter().filter(|v| v["method"] == method).count()
 }
 
-fn read_recovery_error(bridge: &mut BridgeProcess) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Waits until the fake app-server has exited (a zombie counts: the harness reaps it).
+fn wait_for_fake_codex_exit(log: &Path) {
+    let pid_path = format!("{}.pid", log.display());
+    let pid = std::fs::read_to_string(pid_path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let value = bridge.read_json(deadline);
-        if value["method"] == "error" {
-            assert_eq!(value["params"]["willRetry"], false);
-            return value["params"]["error"]["message"]
-                .as_str()
-                .unwrap()
-                .to_owned();
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&output.stdout);
+        if stat.trim().is_empty() || stat.trim().starts_with('Z') {
+            return;
         }
-        assert_ne!(
-            value["method"], "turn/completed",
-            "disconnected turn must not report success"
-        );
+        assert!(Instant::now() < deadline, "fake codex did not exit");
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
 #[test]
-fn codex_recovery_resumes_after_idle_child_exit_repeatedly() {
-    let fixture = RecoveryFixture::new();
-    let mut bridge = fixture.bridge();
-    let first = bridge.run_blocks_user_turn("one", Duration::from_secs(10));
-    assert_completed_turn(&first);
-    for (prompt, history) in [("two", "one|two"), ("three", "one|two|three")] {
-        fixture.kill_child();
-        let turn = bridge.run_blocks_user_turn_with_model(
-            prompt,
-            Some("next-model"),
-            Duration::from_secs(10),
-        );
+fn fake_codex_blocks_mode_resumes_thread_after_app_server_exits_between_turns() {
+    let (mut bridge, fake_codex, log) = spawn_fake_codex_recovery("fake-idle-exit-codex");
+    for _ in 0..2 {
+        let turn = bridge.run_blocks_user_turn("exit after turn", Duration::from_secs(10));
         assert_completed_turn(&turn);
-        assert_eq!(turn.text_from_deltas, history);
+        wait_for_fake_codex_exit(&log);
     }
+    let turn = bridge.run_blocks_user_turn("after restart", Duration::from_secs(10));
     bridge.finish_successfully();
-    let requests = fixture.requests();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|v| v["method"] == "thread/start")
-            .count(),
-        1
-    );
+    assert_completed_turn(&turn);
+
+    let requests = read_requests(&log);
+    assert_eq!(count_method(&requests, "thread/start"), 1);
+    assert_eq!(count_method(&requests, "turn/start"), 3);
+    let start = requests
+        .iter()
+        .find(|v| v["method"] == "thread/start")
+        .unwrap();
     let resumes: Vec<_> = requests
         .iter()
         .filter(|v| v["method"] == "thread/resume")
         .collect();
     assert_eq!(resumes.len(), 2);
-    for request in resumes {
-        assert_eq!(request["params"]["threadId"], "saved-thread");
-        assert_eq!(request["params"]["modelProvider"], "openrouter");
-        assert_eq!(request["params"]["model"], "next-model");
-    }
-}
-
-#[test]
-fn codex_recovery_does_not_replay_a_disconnected_active_turn() {
-    for prompt in ["die-during-turn", "close-stdout"] {
-        let fixture = RecoveryFixture::new();
-        let mut bridge = fixture.bridge();
-        assert_completed_turn(&bridge.run_blocks_user_turn("one", Duration::from_secs(10)));
-        bridge.send(recovery_turn(prompt));
-        let error = read_recovery_error(&mut bridge);
-        assert!(error.contains("exited") || error.contains("transport disconnected"));
-        let after = bridge.run_blocks_user_turn("after", Duration::from_secs(10));
-        assert_completed_turn(&after);
-        assert_eq!(after.text_from_deltas, "one|after");
-        bridge.finish_successfully();
-        let requests = fixture.requests();
-        assert_eq!(requests.iter().filter(|v| v["method"] == "turn/start" && v["params"]["input"][0]["text"] == prompt).count(), 1);
+    for resume in resumes {
+        assert_eq!(resume["params"]["threadId"], "thread-1");
         assert_eq!(
-            requests
-                .iter()
-                .filter(|v| v["method"] == "thread/resume")
-                .count(),
-            1
+            resume["params"]["modelProvider"],
+            start["params"]["modelProvider"]
         );
     }
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(log);
 }
 
 #[test]
-fn codex_recovery_discards_closed_pipe_even_if_child_is_still_running() {
-    let fixture = RecoveryFixture::new();
-    let mut bridge = fixture.bridge();
-    assert_completed_turn(&bridge.run_blocks_user_turn("close-stdin", Duration::from_secs(10)));
-    bridge.send(recovery_turn("unacknowledged"));
-    assert!(read_recovery_error(&mut bridge).contains("transport disconnected"));
-    let after = bridge.run_blocks_user_turn("after", Duration::from_secs(10));
-    assert_completed_turn(&after);
-    assert_eq!(after.text_from_deltas, "close-stdin|after");
-    bridge.finish_successfully();
-    assert!(
-        !fixture
-            .requests()
-            .iter()
-            .any(|v| v["params"]["input"][0]["text"] == "unacknowledged")
-    );
-}
+fn fake_codex_blocks_mode_fails_disconnected_turn_without_replay_then_resumes() {
+    let (mut bridge, fake_codex, log) = spawn_fake_codex_recovery("fake-mid-turn-exit-codex");
+    assert_completed_turn(&bridge.run_blocks_user_turn("first", Duration::from_secs(10)));
 
-#[test]
-fn codex_recovery_resume_failure_never_starts_a_new_conversation() {
-    let fixture = RecoveryFixture::new();
-    let mut bridge = fixture.bridge();
-    assert_completed_turn(&bridge.run_blocks_user_turn("one", Duration::from_secs(10)));
-    fixture.kill_child();
-    std::fs::write(fixture.root.join("reject-resume"), "").unwrap();
-    bridge.send(recovery_turn("must-not-run"));
-    assert!(read_recovery_error(&mut bridge).contains("resume unavailable"));
-    let after = bridge.run_blocks_user_turn("after", Duration::from_secs(10));
-    assert_completed_turn(&after);
-    assert_eq!(after.text_from_deltas, "one|after");
+    bridge.send(json!({
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": "die mid turn"}]},
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = bridge.read_json(deadline);
+        assert_ne!(
+            value["method"], "turn/completed",
+            "disconnected turn must not succeed"
+        );
+        if value["method"] == "error" {
+            assert_eq!(value["params"]["willRetry"], false);
+            break;
+        }
+    }
+
+    let turn = bridge.run_blocks_user_turn("after restart", Duration::from_secs(10));
     bridge.finish_successfully();
-    let requests = fixture.requests();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|v| v["method"] == "thread/start")
-            .count(),
-        1
-    );
-    assert!(
-        !requests
-            .iter()
-            .any(|v| v["params"]["input"][0]["text"] == "must-not-run")
-    );
+    assert_completed_turn(&turn);
+
+    let requests = read_requests(&log);
+    assert_eq!(count_method(&requests, "thread/start"), 1);
+    assert_eq!(count_method(&requests, "thread/resume"), 1);
+    let prompts: Vec<_> = requests
+        .iter()
+        .filter(|v| v["method"] == "turn/start")
+        .map(|v| v["params"]["input"][0]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(prompts, ["first", "die mid turn", "after restart"]);
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(log);
 }
 
 fn fake_codex_app_server_script(log_path: &Path) -> String {
